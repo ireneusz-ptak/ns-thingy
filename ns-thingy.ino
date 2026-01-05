@@ -21,6 +21,7 @@
 const unsigned long DATA_FETCH_INTERVAL_MS   = 30 * 1000;
 const unsigned long STATUS_FETCH_INTERVAL_MS = 60 * 60 * 1000;
 const unsigned long DISPLAY_UPDATE_INTERVAL_MS = 10 * 1000;
+const unsigned long STALE_DATA_THRESHOLD_MS = 13 * 60 * 1000;
 
 // –––––– API Configuration ––––––
 const int JSON_DOC_SIZE = 8192;
@@ -35,8 +36,10 @@ String wifiSSID;
 String wifiPassword;
 String nightscoutURL;
 String accessToken;
+
 bool mmol;
 bool useLed;
+
 uint8_t ledIntensity = 64;
 
 // BG levels - Default fallback values. These will be updated from Nightscout.
@@ -46,28 +49,26 @@ int highWarning = 180;
 int highUrgent = 240;
 
 //–––––– Global Data & Timing ––––––
-unsigned long lastDataFetchTime = 0;
-unsigned long lastStatusFetchTime = 0;
-unsigned long lastDisplayUpdateTime = 0;
-unsigned long lastUpdate = 0;
-unsigned long long lastTimestamp = 0; // Nightscout's timestamp of last data
+unsigned long long lastDataFetchTime = 0;
+unsigned long long lastStatusFetchTime = 0;
+unsigned long long lastDisplayUpdateTime = 0;
+unsigned long long lastUpdate = 0; // board time
+unsigned long long lastTimestamp = 0; // NS time
 
 // BG values
 float bg;
 float delta;
 String trend;
-unsigned long long timestamp;
 
 void showMessage(String line1, String line2 = "", int delay_ms = 2000) {
     spr.fillSprite(TFT_BLACK);
     spr.setTextDatum(MC_DATUM);
-    spr.setTextFont(FONT2);
-    spr.drawString(line1, tft.width() / 2, tft.height() / 2 - 10);
+    spr.setTextFont(FONT4);
+    spr.drawString(line1, tft.width() / 2, tft.height() / 2 - 10, GFXFF);
     if (line2 != "") {
-        spr.drawString(line2, tft.width() / 2, tft.height() / 2 + 20);
+        spr.drawString(line2, tft.width() / 2, tft.height() / 2 + 20, GFXFF);
     }
     spr.pushSprite(0, 0);
-    Serial.println(line1 + " " + line2);
     delay(delay_ms);
 }
 
@@ -79,7 +80,7 @@ void setup() {
   tft.setTextColor(TFT_WHITE);
 
   if(!SD_MMC.setPins(SD_CLK_PIN, SD_CMD_PIN, SD_D0_PIN, SD_D1_PIN, SD_D2_PIN, SD_D3_PIN)){
-    tft.println("SD MMC: Pin change failed!");
+    showMessage("SD MMC Error", "Pin settings failed!", 5000);
     Serial.println("SD MMC: Pin change failed!");
     while(1);
   }
@@ -93,7 +94,6 @@ void setup() {
   }
 
   if (!readConfig()){
-    showMessage("Config Error", "Check config.json", 5000);
     while(1);
   }
 
@@ -102,12 +102,14 @@ void setup() {
 
 void loop() {
   unsigned long currentTime = millis();
+  bool dataFetchFailed;
+  bool statusFetchFailed;
 
   if (WiFi.status() != WL_CONNECTED) {
     connectWiFi();
     if(WiFi.status() == WL_CONNECTED) {
-        fetchStatus();
-        fetchData();
+        statusFetchFailed = !fetchStatus();
+        dataFetchFailed = !fetchData();
         lastStatusFetchTime = currentTime;
         lastDataFetchTime = currentTime;
     }
@@ -115,16 +117,20 @@ void loop() {
   }
 
   if (currentTime - lastStatusFetchTime >= STATUS_FETCH_INTERVAL_MS || lastStatusFetchTime == 0) {
-    fetchStatus();
-    lastStatusFetchTime = currentTime;
+    statusFetchFailed = !fetchStatus();
+    if (!statusFetchFailed) {
+      lastStatusFetchTime = currentTime;
+    }
   }
 
   if (currentTime - lastDataFetchTime >= DATA_FETCH_INTERVAL_MS || lastDataFetchTime == 0) {
-    fetchData();
-    lastDataFetchTime = currentTime;
+    dataFetchFailed = !fetchData();
+    if (!dataFetchFailed) {
+      lastDataFetchTime = currentTime;
+    }
   }
 
-  if (currentTime - lastDisplayUpdateTime >= DISPLAY_UPDATE_INTERVAL_MS) {
+  if (currentTime - lastDisplayUpdateTime >= DISPLAY_UPDATE_INTERVAL_MS && !dataFetchFailed && !statusFetchFailed) {
     updateDisplay();
     updateLED();
     lastDisplayUpdateTime = currentTime;
@@ -150,23 +156,24 @@ void connectWiFi() {
       Serial.println("\nWiFi connected.");
       Serial.print("IP address: ");
       Serial.println(WiFi.localIP());
-      showMessage("WiFi Connected!", WiFi.localIP().toString());
+      showMessage("WiFi connected!", WiFi.localIP().toString());
     } else {
       Serial.println("\nWiFi connection failed.");
-      showMessage("WiFi Failed", "Check credentials.", 5000);
+      showMessage("WiFi connection failed", "Check credentials.", 5000);
     }
   } else {
-    showMessage("WiFi Error", "No SSID defined.", 5000);
+    showMessage("WiFi error", "No SSID defined.", 5000);
   }
   setLEDColor(0, 0, 0);
 }
 
 bool readConfig() {
-  showMessage("Reading Config...", "", 500);
+  showMessage("Reading config...", "", 500);
   File configFile = SD_MMC.open("/config.json");
 
   if (!configFile) {
     Serial.println("Failed to open config.json.");
+    showMessage("Config error", "Cannot open /config.json file", 3000);
     return false;
   }
 
@@ -177,6 +184,7 @@ bool readConfig() {
   if (error) {
     Serial.print("JSON parse error: ");
     Serial.println(error.c_str());
+    showMessage("Config error", "JSON parse failed", 3000);
     return false;
   }
 
@@ -184,18 +192,26 @@ bool readConfig() {
   wifiPassword  = doc["wifi_password"].as<String>();
   nightscoutURL = doc["nightscout_url"].as<String>();
   accessToken   = doc["access_token"].as<String>();
-  mmol          = doc.containsKey("rotate") && doc["mmol"].as<bool>();
+
+  mmol          = doc.containsKey("mmol") && doc["mmol"].as<bool>();
   useLed        = doc.containsKey("use_led") && doc["use_led"].as<bool>();
+
+  nightscoutURL.trim();
+  while (nightscoutURL.endsWith("/")) {
+    nightscoutURL.remove(nightscoutURL.length() - 1);
+  }
 
   if (doc.containsKey("rotate") && doc["rotate"].as<bool>()) {
     tft.setRotation(1);
   }
+
   Serial.println("Configuration loaded from SD.");
+  Serial.println("Nightscout URL: " + nightscoutURL);
   return true;
 }
 
-void fetchStatus() {
-  if (WiFi.status() != WL_CONNECTED) return;
+bool fetchStatus() {
+  if (WiFi.status() != WL_CONNECTED) return false;
 
   HTTPClient http;
   String url = nightscoutURL + "/api/v1/status.json";
@@ -214,7 +230,9 @@ void fetchStatus() {
     if (error) {
       Serial.print("deserializeJson() failed for status: ");
       Serial.println(error.c_str());
-      return;
+      showMessage("NS status fetch error", "JSON parse failed", 2000);
+      http.end();
+      return false;
     }
 
     if (doc.containsKey("settings") && doc["settings"].containsKey("thresholds")) {
@@ -251,12 +269,16 @@ void fetchStatus() {
     }
   } else {
     Serial.printf("HTTP error on status fetch, code: %d\n", httpCode);
+    showMessage("NS status fetch error", "HTTP: " + String(httpCode), 2000);
+    http.end();
+    return false;
   }
   http.end();
+  return true;
 }
 
-void fetchData() {
-  if (WiFi.status() != WL_CONNECTED) return;
+bool fetchData() {
+  if (WiFi.status() != WL_CONNECTED) return false;
 
   HTTPClient http;
   String url = nightscoutURL + "/api/v2/properties.json";
@@ -275,34 +297,44 @@ void fetchData() {
     if (error) {
       Serial.print("deserializeJson() failed for data: ");
       Serial.println(error.c_str());
-      showMessage("Data Error", "JSON parsing failed");
-      return;
+      showMessage("NS data fetch error", "JSON parsing failed", 2000);
+      http.end();
+      return false;
     }
 
     if (!doc.containsKey("bgnow") || !doc["bgnow"]["sgvs"].is<JsonArray>() || doc["bgnow"]["sgvs"].size() == 0) {
       Serial.println("BG data not found in API response.");
-      showMessage("Data Error", "No BG value found");
-      return;
+      showMessage("NS data error", "No BG value found", 2000);
+      http.end();
+      return false;
     }
 
     unsigned long long newTimestamp = doc["bgnow"]["mills"].as<unsigned long long>();
 
     if (newTimestamp != lastTimestamp) {
-      timestamp = newTimestamp;
+      unsigned long long timestamp = newTimestamp;
       bg = doc["bgnow"]["sgvs"][0]["mgdl"].as<float>();
       delta = doc["delta"]["mgdl"].as<float>();
       trend = doc["bgnow"]["sgvs"][0]["direction"].as<String>();
-      lastTimestamp = timestamp;
-      lastUpdate = millis();
-      Serial.println("New BG data received.");
+      if (bg > 30.0) {
+        lastTimestamp = timestamp;
+        lastUpdate = millis();
+        Serial.println("New BG data received.");
+        Serial.printf("BG: %.0f mg/dL, Delta: %.1f, Trend: %s\n", bg, delta, trend.c_str());
+      } else {
+        Serial.println("Invalid BG value (error?).");  
+      }
     } else {
       Serial.println("BG data is the same as last fetch.");
     }
   } else {
     Serial.printf("HTTP error on data fetch, code: %d\n", httpCode);
-    showMessage("Fetch Error", "Code: " + String(httpCode));
+    showMessage("NS data fetch error", "HTTP: " + String(httpCode), 2000);
+    http.end();
+    return false;
   }
   http.end();
+  return true;
 }
 
 void updateDisplay() {
@@ -341,10 +373,30 @@ String getBGValue(float rawBG) {
 }
 
 void updateBGValue() {
+  bool isStale = (millis() - lastUpdate) > STALE_DATA_THRESHOLD_MS;
   uint8_t td = spr.getTextDatum();
   spr.setTextDatum(TC_DATUM);
-  spr.drawString(getBGValue(bg), 120, 15, FONT8);
+  
+  if (isStale) {
+    spr.setTextColor(TFT_DARKGREY);
+  } else {
+    spr.setTextColor(TFT_WHITE);
+  }
+  
+  String bgString = getBGValue(bg);
+  spr.drawString(bgString, 120, 15, FONT8);
+  
+  if (isStale) {
+    int16_t textWidth = spr.textWidth(bgString, FONT8);
+    int16_t strikeY = 52;
+    int16_t strikeX1 = 120 - textWidth / 2;
+    int16_t strikeX2 = 120 + textWidth / 2;
+    spr.drawLine(strikeX1, strikeY, strikeX2, strikeY, TFT_DARKGREY);
+    spr.drawLine(strikeX1, strikeY + 1, strikeX2, strikeY + 1, TFT_DARKGREY);
+  }
+  
   spr.setTextDatum(td);
+  spr.setTextColor(TFT_WHITE);
 }
 
 void updateDelta() {
@@ -358,7 +410,6 @@ void updateDelta() {
   spr.setTextColor(TFT_WHITE);
 }
 
-// --- THIS IS THE MODIFIED FUNCTION ---
 void updateTimestamp() {
   String minutesDisp = "?";
 
@@ -368,11 +419,12 @@ void updateTimestamp() {
   }
 
   spr.setTextDatum(TC_DATUM);
-  spr.setTextColor(TFT_LIGHTGREY);
+
   spr.setFreeFont(FSS18);
   spr.drawString(minutesDisp, 250, 100, GFXFF);
   spr.setFreeFont(FSS12);
   spr.drawString("min. ago", 250, 135, GFXFF);
+
   spr.setTextColor(TFT_WHITE);
 }
 
@@ -414,12 +466,15 @@ void setLEDColor(uint8_t r, uint8_t g, uint8_t b) {
 
 void updateLED() {
   if (lastTimestamp == 0) return;
-
+  // Normal color logic (thresholds are always in mg/dL internally)
   if (bg < lowUrgent || bg > highUrgent) {
-    setLEDColor(ledIntensity, 0, 0); // Red for Urgent
+    Serial.println("LED: red");
+    setLEDColor(ledIntensity, 0, 0);
   } else if (bg < lowWarning || bg > highWarning) {
-    setLEDColor(ledIntensity, ledIntensity, 0); // Yellow for Warning
+    Serial.println("LED: yellow");
+    setLEDColor(ledIntensity, ledIntensity, 0);
   } else {
-    setLEDColor(0, ledIntensity, 0); // Green for In Range
+    Serial.println("LED: green");
+    setLEDColor(0, ledIntensity, 0);
   }
 }
